@@ -1,4 +1,4 @@
-# fastpercentile: Memory-bandwidth-bound percentile for small-integer arrays
+# fastpercentile: As-fast-as-possible median & percentile calculation on integer arrays
 
 [![Tests](https://github.com/jasper-tms/fastpercentile/actions/workflows/tests.yml/badge.svg)](https://github.com/jasper-tms/fastpercentile/actions/workflows/tests.yml)
 [![PyPI version](https://img.shields.io/pypi/v/fastpercentile)](https://pypi.org/project/fastpercentile/)
@@ -47,6 +47,8 @@ for command in commands_to_run.strip().splitlines():
 ```
 
 </details>
+
+The speed of the optimized calculation is no longer limited by CPU processing speed, but instead by data transfer bandwidth between the RAM and the CPU. Therefore, this runs literally as fast as your hardware could possibly allow.
 
 ### Algorithm
 
