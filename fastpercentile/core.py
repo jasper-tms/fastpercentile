@@ -45,7 +45,7 @@ import numpy as np
 from numba import njit, prange, get_num_threads
 from typing import Sequence, Union
 
-__all__ = ['percentile', 'histogram', 'warmup']
+__all__ = ['percentile', 'median', 'histogram', 'warmup']
 
 
 # --------------------------------------------------------------- #
@@ -595,6 +595,32 @@ def percentile(arr: np.ndarray,
     if q_was_scalar:
         return float(out[0])
     return out
+
+
+def median(arr: np.ndarray,
+           n_threads: Union[int, None] = None) -> float:
+    """
+    Compute the median of `arr`, equivalent to `numpy.median(arr)`.
+
+    This is a thin wrapper around `percentile(arr, 50)`: the median
+    is the 50th percentile, and the 'linear' interpolation used by
+    `percentile` averages the two middle values for even-length
+    inputs, exactly as `numpy.median` does.
+
+    Parameters
+    ----------
+    arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
+            int64/uint64
+        Any shape; treated as a flat sequence of values.
+    n_threads : int, optional
+        Number of parallel histogram threads.  Defaults to
+        `numba.get_num_threads()`.
+
+    Returns
+    -------
+    float
+    """
+    return percentile(arr, 50, n_threads=n_threads)
 
 
 def warmup() -> None:

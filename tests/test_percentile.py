@@ -45,6 +45,27 @@ def test_unsorted_q_returns_in_input_order(warm_jit, random_1d):
     assert np.allclose(expected, got, atol=1e-9)
 
 
+def test_median_matches_numpy(warm_jit, random_1d):
+    """
+    `median` is the 50th percentile and should match `np.median`,
+    returning a Python float.
+    """
+    got = fastpercentile.median(random_1d)
+    assert isinstance(got, float)
+    assert abs(got - float(np.median(random_1d))) < 1e-9
+
+
+def test_median_even_length_averages_middle_pair(warm_jit):
+    """
+    For an even-length array the median is the average of the two
+    middle values, matching `np.median` (and giving a non-integer
+    result when those two values differ by an odd amount).
+    """
+    arr = np.array([10, 20, 30, 41], dtype=np.uint16)
+    assert fastpercentile.median(arr) == 25.0
+    assert fastpercentile.median(arr) == float(np.median(arr))
+
+
 def test_endpoints():
     """
     Percentile 0 should equal the min, 100 should equal the max.

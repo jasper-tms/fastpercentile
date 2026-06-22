@@ -54,6 +54,9 @@ arr = np.random.randint(0, 65536, size=(305, 96, 69, 846), dtype=np.uint16)
 # A scalar percentile
 p99 = fastpercentile.percentile(arr, 99)
 
+# The median (50th percentile)
+m = fastpercentile.median(arr)
+
 # Multiple percentiles in a single pass over the data
 p1, p50, p99, p99_9 = fastpercentile.percentile(arr, [1, 50, 99, 99.9])
 
