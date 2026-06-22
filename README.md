@@ -42,8 +42,8 @@ fastpercentile.percentile(arr, qs)
 
 for command in commands_to_run.strip().splitlines():
     start = time.perf_counter()
-    eval(command)
-    print(f'{command.split("(")[0]:26s}: {time.perf_counter() - start:6.3f} seconds')
+    result = eval(command)
+    print(f'{command.split("(")[0]:26s}: {time.perf_counter() - start:6.3f} seconds, result {result}')
 ```
 
 </details>
