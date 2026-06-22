@@ -42,7 +42,11 @@ Results match `numpy.percentile(arr, q)` with the default `'linear'` interpolati
 
 ### Supported dtypes
 
-`int8`, `uint8`, `int16`, `uint16`. Floats and 32/64-bit integers are not supported because a direct histogram is not feasible for them — for those, use `numpy.percentile` or `bottleneck.nanpercentile`.
+All integer dtypes: `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`, `int64`, `uint64`. Floats are not supported — for those, use `numpy.percentile` or `bottleneck.nanpercentile`.
+
+8- and 16-bit integers use the single-pass histogram described above. For 32- and 64-bit integers a direct histogram is infeasible (it would need `2**32` or `2**64` bins), so they use a **radix refinement** instead: the first pass histograms only the top 16 bits of each value, which localizes each requested percentile to a coarse bucket; later passes re-scan the array but only count the next 16 bits of the few elements inside those buckets, narrowing the answer 16 bits at a time. This costs one pass per 16-bit digit — two for 32-bit input, four for 64-bit — and keeps auxiliary memory at the same fixed 65 536-bin scale. It's still far faster than `numpy.percentile`, just with a 2× or 4× larger constant than the 16-bit path. (For 64-bit values above `2**53` the result carries the same float64 rounding `numpy.percentile` does.)
+
+`fastpercentile.histogram()` only returns a full histogram for the 8- and 16-bit dtypes; for wider integers a full histogram isn't feasible, so call `percentile()` directly.
 
 
 ### Memory layout

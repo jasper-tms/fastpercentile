@@ -7,6 +7,17 @@ module computes one or more percentiles in a single parallel pass
 over the data with results matching `numpy.percentile` (default
 'linear' / method 7 interpolation).
 
+For `int32`, `uint32`, `int64`, and `uint64` inputs a direct
+histogram over every possible value is not feasible (it would need
+`2 ** 32` or `2 ** 64` bins).  Instead we use a radix refinement:
+the first pass histograms only the top 16 bits of each value, which
+tells us which coarse bucket each requested percentile falls in.
+Subsequent passes re-scan the array but only count the next 16 bits
+of the few elements inside those buckets, narrowing the answer 16
+bits at a time until the exact value is pinned.  This costs one pass
+per 16-bit "digit" (two passes for 32-bit input, four for 64-bit)
+and keeps the auxiliary memory at the same fixed 65536-bin scale.
+
 The idea
 --------
 For an N-element array with at most B distinct values (B = 256 for
@@ -17,6 +28,10 @@ inner loop -- so it runs at memory bandwidth.  After the scan we
 walk the cumulative histogram to locate the bins containing each
 requested rank; that walk is O(B + n_percentiles) which is
 negligible.
+
+For wider integers we split each value into 16-bit digits (most
+significant first) and resolve those digits one pass at a time, as
+described above.
 
 Public API
 ----------
@@ -141,6 +156,100 @@ def _hist_i16(arr: np.ndarray,
 
 
 # --------------------------------------------------------------- #
+# Radix histograms for 32- and 64-bit integers.  We never allocate
+# 2 ** 32 bins; instead every pass histograms a single 16-bit
+# "digit" of an order-preserving unsigned key.
+#
+# The key is the raw bits reinterpreted as unsigned, XORed with
+# `flip` -- 0 for unsigned dtypes and the sign bit (2 ** (bits - 1))
+# for signed dtypes.  Flipping the sign bit maps the signed range
+# onto the unsigned range while preserving numeric order, so the
+# usual cumulative-count walk works on the key and we convert back
+# to the original value only at the very end.
+# --------------------------------------------------------------- #
+
+
+@njit(cache=True, parallel=True, boundscheck=False)
+def _hist_digit_coarse(arr_u: np.ndarray,
+                       n_threads: int,
+                       flip: np.uint64,
+                       shift: np.uint64) -> np.ndarray:
+    """
+    Parallel histogram of one 16-bit digit of the unsigned key,
+    over every element.  Used for the first (most significant) pass.
+    """
+    n_bins = 65536
+    n = arr_u.shape[0]
+    mask = np.uint64(0xFFFF)
+    local = np.zeros((n_threads, n_bins), dtype=np.int64)
+    chunk = (n + n_threads - 1) // n_threads
+    for t in prange(n_threads):
+        start = t * chunk
+        end = start + chunk
+        if end > n:
+            end = n
+        loc = local[t]
+        for i in range(start, end):
+            key = np.uint64(arr_u[i]) ^ flip
+            digit = (key >> shift) & mask
+            loc[digit] += 1
+    out = np.zeros(n_bins, dtype=np.int64)
+    for t in range(n_threads):
+        for b in range(n_bins):
+            out[b] += local[t, b]
+    return out
+
+
+@njit(cache=True, parallel=True, boundscheck=False)
+def _hist_digit_refine(arr_u: np.ndarray,
+                       n_threads: int,
+                       flip: np.uint64,
+                       shift: np.uint64,
+                       prefixes: np.ndarray) -> np.ndarray:
+    """
+    Parallel histogram of the 16-bit digit at `shift`, but only for
+    elements whose higher bits (`key >> (shift + 16)`) match one of
+    the sorted `prefixes`.  Each matching prefix gets its own
+    histogram row, so a single pass refines every target bucket at
+    once.
+    """
+    n_bins = 65536
+    n_slots = prefixes.shape[0]
+    n = arr_u.shape[0]
+    mask = np.uint64(0xFFFF)
+    prefix_shift = shift + np.uint64(16)
+    local = np.zeros((n_threads, n_slots, n_bins), dtype=np.int64)
+    chunk = (n + n_threads - 1) // n_threads
+    for t in prange(n_threads):
+        start = t * chunk
+        end = start + chunk
+        if end > n:
+            end = n
+        loc = local[t]
+        for i in range(start, end):
+            key = np.uint64(arr_u[i]) ^ flip
+            prefix = key >> prefix_shift
+            # Binary search for `prefix` in the sorted prefix list.
+            lo = 0
+            hi = n_slots
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if prefixes[mid] < prefix:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < n_slots and prefixes[lo] == prefix:
+                digit = (key >> shift) & mask
+                loc[lo, digit] += 1
+    out = np.zeros((n_slots, n_bins), dtype=np.int64)
+    for t in range(n_threads):
+        for s in range(n_slots):
+            for b in range(n_bins):
+                out[s, b] += local[t, s, b]
+    return out
+
+
+# --------------------------------------------------------------- #
 # Rank-walking from a finished histogram.  Caller must sort the
 # percentiles ascending so we can scan the cumulative count once.
 # --------------------------------------------------------------- #
@@ -212,6 +321,146 @@ _DTYPE_DISPATCH = {
 }
 
 
+# Wide integer dtypes resolved by radix refinement.  Each entry is
+# (unsigned view dtype, sign-bit flip, number of 16-bit digits).
+_WIDE_DISPATCH = {
+    np.dtype('uint32'): (np.uint32, 0,            2),
+    np.dtype('int32'):  (np.uint32, 1 << 31,      2),
+    np.dtype('uint64'): (np.uint64, 0,            4),
+    np.dtype('int64'):  (np.uint64, 1 << 63,      4),
+}
+
+_SUPPORTED_DTYPE_MESSAGE = (
+    'fastpercentile supports int8/uint8/int16/uint16 (single pass) and '
+    'int32/uint32/int64/uint64 (radix refinement), got ')
+
+
+def _key_to_value(key: int,
+                  flip: int,
+                  bits: int) -> float:
+    """
+    Convert a fully resolved unsigned key back to the numeric value
+    of the original dtype, as a float.
+
+    Parameters
+    ----------
+    key : int
+        The order-preserving unsigned key (all digits resolved).
+    flip : int
+        The sign-bit flip used to build the key: 0 for unsigned
+        dtypes, `2 ** (bits - 1)` for signed dtypes.
+    bits : int
+        Width of the original dtype in bits.
+
+    Returns
+    -------
+    float
+    """
+    unsigned_value = key ^ flip
+    if flip == 0:
+        return float(unsigned_value)
+    if unsigned_value >= (1 << (bits - 1)):
+        return float(unsigned_value - (1 << bits))
+    return float(unsigned_value)
+
+
+def _resolve_wide(arr_u: np.ndarray,
+                  n_total: int,
+                  ranks_lo: np.ndarray,
+                  ranks_hi: np.ndarray,
+                  fracs: np.ndarray,
+                  flip: int,
+                  bits: int,
+                  n_digits: int,
+                  n_threads: int) -> np.ndarray:
+    """
+    Resolve percentiles for a wide-integer array by radix refinement.
+
+    The first pass histograms the most significant 16-bit digit of
+    every element's key; each subsequent pass histograms the next
+    digit, but only for the few coarse buckets that still contain a
+    requested rank.  After `n_digits` passes every requested order
+    statistic is pinned to an exact value.
+
+    Parameters
+    ----------
+    arr_u : np.ndarray
+        The input reinterpreted as an unsigned integer array of the
+        same width.
+    n_total : int
+        Total number of elements.
+    ranks_lo, ranks_hi : int64 arrays of equal length
+        0-indexed integer ranks bracketing each query, in the sorted
+        order produced by the caller.
+    fracs : float64 array
+        Fractional position between `ranks_lo` and `ranks_hi`.
+    flip : int
+        Sign-bit flip for the key (see `_key_to_value`).
+    bits : int
+        Width of the original dtype in bits.
+    n_digits : int
+        Number of 16-bit digits to resolve (`bits // 16`).
+    n_threads : int
+        Number of parallel threads.
+
+    Returns
+    -------
+    float64 array of interpolated percentile values, aligned with
+    `ranks_lo`.
+    """
+    flip_u = np.uint64(flip)
+
+    # The distinct ranks we must pin down: each percentile needs the
+    # order statistic just below and just above it (often the same
+    # bucket, occasionally adjacent ones).  Deduplicate so shared
+    # buckets are refined only once.
+    target_ranks = np.unique(np.concatenate([ranks_lo, ranks_hi]))
+    n_targets = target_ranks.shape[0]
+
+    # `resolved[j]` accumulates the high bits of target j's key as a
+    # number equal to `key >> shift`; `base[j]` is the count of all
+    # elements whose key is strictly below target j's current bucket.
+    resolved = np.zeros(n_targets, dtype=np.uint64)
+    base = np.zeros(n_targets, dtype=np.int64)
+
+    shift = 16 * (n_digits - 1)
+
+    # First (coarse) pass over every element.
+    hist = _hist_digit_coarse(arr_u, n_threads, flip_u, np.uint64(shift))
+    cum = np.cumsum(hist)
+    bins = np.searchsorted(cum, target_ranks, side='right')
+    resolved[:] = bins.astype(np.uint64)
+    base[:] = cum[bins] - hist[bins]
+    shift -= 16
+
+    # Refinement passes for the remaining digits.
+    while shift >= 0:
+        prefixes = np.unique(resolved)
+        hists = _hist_digit_refine(
+            arr_u, n_threads, flip_u, np.uint64(shift), prefixes)
+        cums = np.cumsum(hists, axis=1)
+        for j in range(n_targets):
+            slot = int(np.searchsorted(prefixes, resolved[j]))
+            local_rank = int(target_ranks[j] - base[j])
+            digit = int(np.searchsorted(cums[slot], local_rank, side='right'))
+            cum_before = int(cums[slot, digit] - hists[slot, digit])
+            resolved[j] = (resolved[j] << np.uint64(16)) | np.uint64(digit)
+            base[j] += cum_before
+        shift -= 16
+
+    # Map each resolved rank to its value, then interpolate.
+    value_by_rank = {
+        int(target_ranks[j]): _key_to_value(int(resolved[j]), flip, bits)
+        for j in range(n_targets)
+    }
+    out = np.empty(ranks_lo.shape[0], dtype=np.float64)
+    for k in range(ranks_lo.shape[0]):
+        value_lo = value_by_rank[int(ranks_lo[k])]
+        value_hi = value_by_rank[int(ranks_hi[k])]
+        out[k] = value_lo + fracs[k] * (value_hi - value_lo)
+    return out
+
+
 def _as_flat_view(arr: np.ndarray) -> np.ndarray:
     """
     Return a 1D view of `arr` without copying when possible.
@@ -232,6 +481,11 @@ def histogram(arr: np.ndarray,
     """
     Build a parallel histogram of `arr`.
 
+    Only the small-integer dtypes (int8/uint8/int16/uint16) have a
+    direct full histogram; for 32/64-bit integers a single histogram
+    over every value is not feasible, so use `percentile` instead
+    (which resolves the values it needs by radix refinement).
+
     Parameters
     ----------
     arr : np.ndarray of int8/uint8/int16/uint16
@@ -251,12 +505,15 @@ def histogram(arr: np.ndarray,
     if n_threads is None:
         n_threads = get_num_threads()
     arr_flat = _as_flat_view(arr)
+    if arr_flat.dtype in _WIDE_DISPATCH:
+        raise TypeError(
+            'a full histogram is not feasible for 32/64-bit integers '
+            '(' + str(arr_flat.dtype) + '); use percentile() instead, '
+            'which resolves only the values it needs')
     try:
         hist_fn, _ = _DTYPE_DISPATCH[arr_flat.dtype]
     except KeyError:
-        raise TypeError(
-            'fastpercentile only supports int8/uint8/int16/uint16, '
-            'got ' + str(arr_flat.dtype))
+        raise TypeError(_SUPPORTED_DTYPE_MESSAGE + str(arr_flat.dtype))
     return hist_fn(arr_flat, n_threads)
 
 
@@ -272,9 +529,14 @@ def percentile(arr: np.ndarray,
     interpolation method to within float rounding (typically exact
     for integer inputs).
 
+    For int8/uint8/int16/uint16 this is a single parallel histogram
+    pass; for int32/uint32/int64/uint64 it is a radix refinement of
+    two (32-bit) or four (64-bit) passes.
+
     Parameters
     ----------
-    arr : np.ndarray of int8/uint8/int16/uint16
+    arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
+            int64/uint64
         Any shape; treated as a flat sequence of values.
     q : float or sequence of floats in [0, 100]
         Percentile(s) to compute.
@@ -296,14 +558,9 @@ def percentile(arr: np.ndarray,
     if n_total == 0:
         raise ValueError('percentile of empty array is undefined')
 
-    try:
-        hist_fn, offset = _DTYPE_DISPATCH[arr_flat.dtype]
-    except KeyError:
-        raise TypeError(
-            'fastpercentile only supports int8/uint8/int16/uint16, '
-            'got ' + str(arr_flat.dtype))
-
-    hist = hist_fn(arr_flat, n_threads)
+    dtype = arr_flat.dtype
+    if dtype not in _DTYPE_DISPATCH and dtype not in _WIDE_DISPATCH:
+        raise TypeError(_SUPPORTED_DTYPE_MESSAGE + str(dtype))
 
     q_in = np.asarray(q, dtype=np.float64)
     q_was_scalar = (q_in.ndim == 0)
@@ -321,7 +578,17 @@ def percentile(arr: np.ndarray,
     ranks_hi = np.minimum(ranks_lo + 1, n_total - 1)
     fracs = exact_rank - ranks_lo
 
-    sorted_out = _ranks_from_hist(hist, ranks_lo, ranks_hi, fracs, offset)
+    if dtype in _DTYPE_DISPATCH:
+        hist_fn, offset = _DTYPE_DISPATCH[dtype]
+        hist = hist_fn(arr_flat, n_threads)
+        sorted_out = _ranks_from_hist(hist, ranks_lo, ranks_hi, fracs, offset)
+    else:
+        view_dtype, flip, n_digits = _WIDE_DISPATCH[dtype]
+        bits = dtype.itemsize * 8
+        arr_u = arr_flat.view(view_dtype)
+        sorted_out = _resolve_wide(
+            arr_u, n_total, ranks_lo, ranks_hi, fracs,
+            flip, bits, n_digits, n_threads)
 
     out = np.empty_like(sorted_out)
     out[order] = sorted_out
@@ -332,9 +599,12 @@ def percentile(arr: np.ndarray,
 
 def warmup() -> None:
     """
-    Trigger JIT compilation for all four dtype paths so the first
-    real call has no compile latency.
+    Trigger JIT compilation for every dtype path so the first real
+    call has no compile latency.  This covers the single-pass small
+    dtypes as well as the coarse and refinement kernels used by the
+    32- and 64-bit radix paths.
     """
-    for dtype in (np.uint8, np.int8, np.uint16, np.int16):
+    for dtype in (np.uint8, np.int8, np.uint16, np.int16,
+                  np.uint32, np.int32, np.uint64, np.int64):
         tiny = np.zeros(8, dtype=dtype)
         percentile(tiny, [0.0, 50.0, 100.0])

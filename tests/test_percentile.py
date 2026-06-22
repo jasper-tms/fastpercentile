@@ -86,13 +86,13 @@ def test_handles_strided_view():
 
 def test_unsupported_dtype_raises():
     """
-    Floats and 32/64-bit ints should error explicitly rather than
-    silently producing garbage.
+    Floats should error explicitly rather than silently producing
+    garbage.  Integer dtypes (including 32/64-bit) are all supported.
     """
     with pytest.raises(TypeError, match='int8/uint8/int16/uint16'):
         fastpercentile.percentile(np.zeros(10, dtype=np.float32), 50)
     with pytest.raises(TypeError):
-        fastpercentile.percentile(np.zeros(10, dtype=np.uint32), 50)
+        fastpercentile.percentile(np.zeros(10, dtype=np.float64), 50)
 
 
 def test_q_out_of_range_raises():
