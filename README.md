@@ -104,7 +104,7 @@ Results match `numpy.percentile(arr, q)` with the default `'linear'` interpolati
     cd ~/repos
     git clone https://github.com/jasper-tms/fastpercentile.git
     cd fastpercentile
-    pip install '.[dev]'
+    pip install .
 
 
 ### Notes on threading

@@ -4,7 +4,7 @@ build-backend = 'setuptools.build_meta'
 
 [project]
 name = 'fastpercentile'
-version = '0.2.1'
+version = '0.2.2'
 description = 'Very fast percentile calculation for small-integer dtypes via parallel histogram'
 readme.file = 'README.md'
 readme.content-type = 'text/markdown'
