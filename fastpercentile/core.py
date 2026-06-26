@@ -43,7 +43,12 @@ Public API
 """
 import numpy as np
 from numba import njit, prange, get_num_threads
-from typing import Sequence, Union
+from typing import Sequence, Tuple, Union
+
+try:  # numpy >= 2.0
+    from numpy.lib.array_utils import normalize_axis_tuple
+except ImportError:  # numpy < 2.0
+    from numpy.core.numeric import normalize_axis_tuple
 
 __all__ = ['percentile', 'median', 'histogram', 'warmup']
 
@@ -309,6 +314,55 @@ def _ranks_from_hist(hist: np.ndarray,
 
 
 # --------------------------------------------------------------- #
+# Group-parallel percentiles for the `axis=` path.  When the
+# reduction produces many groups (one per kept-axis position) the
+# work parallelizes naturally across groups: each group is sorted
+# once and the bracketing order statistics are read off directly.
+# This is dtype-agnostic (it serves the 32/64-bit dtypes too) and,
+# because the interpolation happens in float64, it avoids the
+# integer-overflow `numpy.percentile` itself can exhibit on narrow
+# signed dtypes.
+# --------------------------------------------------------------- #
+
+
+@njit(cache=True, parallel=True, boundscheck=False)
+def _percentile_groups_sorted(reshaped: np.ndarray,
+                              ranks_lo: np.ndarray,
+                              ranks_hi: np.ndarray,
+                              fracs: np.ndarray) -> np.ndarray:
+    """
+    Percentiles of every row of `reshaped`, computed in parallel.
+
+    Parameters
+    ----------
+    reshaped : 2D integer array, shape (n_groups, reduced_size)
+        Each row is one population to take percentiles of.
+    ranks_lo, ranks_hi : int64 arrays
+        0-indexed integer ranks bracketing each query (sorted
+        ascending; same for every row since every row has the same
+        length).
+    fracs : float64 array
+        Fractional position between `ranks_lo` and `ranks_hi`.
+
+    Returns
+    -------
+    float64 array, shape (n_groups, n_q)
+        Percentiles per row, in the (sorted-percentile) order of
+        `ranks_lo`.
+    """
+    n_groups = reshaped.shape[0]
+    n_q = ranks_lo.shape[0]
+    out = np.empty((n_groups, n_q), dtype=np.float64)
+    for g in prange(n_groups):
+        srt = np.sort(reshaped[g])
+        for q in range(n_q):
+            val_lo = np.float64(srt[ranks_lo[q]])
+            val_hi = np.float64(srt[ranks_hi[q]])
+            out[g, q] = val_lo + fracs[q] * (val_hi - val_lo)
+    return out
+
+
+# --------------------------------------------------------------- #
 # Public entry points.
 # --------------------------------------------------------------- #
 
@@ -517,17 +571,114 @@ def histogram(arr: np.ndarray,
     return hist_fn(arr_flat, n_threads)
 
 
+def _ranks_for(q_sorted: np.ndarray,
+               n_total: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Convert sorted percentiles into the bracketing integer ranks and
+    interpolation fractions for an `n_total`-element population.
+
+    Parameters
+    ----------
+    q_sorted : float64 array
+        Percentiles in [0, 100], sorted ascending.
+    n_total : int
+        Number of elements the percentiles are taken over.
+
+    Returns
+    -------
+    ranks_lo, ranks_hi : int64 arrays
+        0-indexed integer ranks bracketing each query.
+    fracs : float64 array
+        Fractional position between `ranks_lo` and `ranks_hi`.
+    """
+    exact_rank = (n_total - 1) * q_sorted / 100.0
+    ranks_lo = np.floor(exact_rank).astype(np.int64)
+    ranks_hi = np.minimum(ranks_lo + 1, n_total - 1)
+    fracs = exact_rank - ranks_lo
+    return ranks_lo, ranks_hi, fracs
+
+
+def _sort_cutoff(dtype: np.dtype) -> int:
+    """
+    Element count below which a direct sort beats the histogram/radix
+    path for `dtype`.
+
+    The histogram path allocates 256 bins for 8-bit dtypes and 65536
+    otherwise, and the radix path repeats a 65536-bin pass once per
+    16-bit digit (twice for 32-bit, four times for 64-bit).  Below
+    roughly `n_bins * n_digits` elements that fixed, multi-pass work
+    dominates and a single sort is cheaper -- and a histogram with far
+    more bins than elements is mostly empty anyway.  Benchmarks put
+    the crossover close to this product for every dtype.
+    """
+    n_bins = 256 if dtype.itemsize == 1 else 65536
+    n_digits = _WIDE_DISPATCH[dtype][2] if dtype in _WIDE_DISPATCH else 1
+    return n_bins * n_digits
+
+
+def _percentile_by_sorting(arr_flat: np.ndarray,
+                           ranks_lo: np.ndarray,
+                           ranks_hi: np.ndarray,
+                           fracs: np.ndarray) -> np.ndarray:
+    """
+    Percentiles of a single small array by directly sorting it.
+
+    When the array holds fewer elements than the histogram would have
+    bins, a histogram is almost entirely empty and its fixed
+    allocate/zero/reduce cost dominates; a plain sort is far cheaper
+    (and dtype-agnostic, so it serves the wide-integer dtypes too).
+
+    Returns the percentiles in the (sorted-percentile) order of
+    `ranks_lo`.
+    """
+    srt = np.sort(arr_flat)
+    val_lo = srt[ranks_lo].astype(np.float64)
+    val_hi = srt[ranks_hi].astype(np.float64)
+    return val_lo + fracs * (val_hi - val_lo)
+
+
+def _percentile_sorted(arr_flat: np.ndarray,
+                       n_total: int,
+                       ranks_lo: np.ndarray,
+                       ranks_hi: np.ndarray,
+                       fracs: np.ndarray,
+                       n_threads: int) -> np.ndarray:
+    """
+    Compute percentiles for a single contiguous 1D array, returning
+    them in the same (sorted-percentile) order as `ranks_lo`.
+
+    Sorts directly when the array is smaller than the histogram bin
+    count; otherwise dispatches to the single-pass histogram for small
+    dtypes and to the radix refinement for 32/64-bit dtypes.
+    """
+    dtype = arr_flat.dtype
+    if n_total < _sort_cutoff(dtype):
+        return _percentile_by_sorting(arr_flat, ranks_lo, ranks_hi, fracs)
+    if dtype in _DTYPE_DISPATCH:
+        hist_fn, offset = _DTYPE_DISPATCH[dtype]
+        hist = hist_fn(arr_flat, n_threads)
+        return _ranks_from_hist(hist, ranks_lo, ranks_hi, fracs, offset)
+    view_dtype, flip, n_digits = _WIDE_DISPATCH[dtype]
+    bits = dtype.itemsize * 8
+    arr_u = arr_flat.view(view_dtype)
+    return _resolve_wide(
+        arr_u, n_total, ranks_lo, ranks_hi, fracs,
+        flip, bits, n_digits, n_threads)
+
+
 def percentile(arr: np.ndarray,
                q: Union[float, Sequence[float], np.ndarray],
+               axis: Union[int, Sequence[int], None] = None,
+               keepdims: bool = False,
                n_threads: Union[int, None] = None
                ) -> Union[float, np.ndarray]:
     """
     Compute one or more percentiles of `arr` via a parallel
     histogram and a cumulative-count walk.
 
-    Matches `numpy.percentile(arr, q)` with the default 'linear'
-    interpolation method to within float rounding (typically exact
-    for integer inputs).
+    Matches `numpy.percentile(arr, q, axis=axis, keepdims=keepdims)`
+    with the default 'linear' interpolation method to within float
+    rounding (typically exact for integer inputs).
 
     For int8/uint8/int16/uint16 this is a single parallel histogram
     pass; for int32/uint32/int64/uint64 it is a radix refinement of
@@ -537,9 +688,19 @@ def percentile(arr: np.ndarray,
     ----------
     arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
             int64/uint64
-        Any shape; treated as a flat sequence of values.
+        Any shape.
     q : float or sequence of floats in [0, 100]
         Percentile(s) to compute.
+    axis : int, sequence of int, or None, optional
+        Axis or axes along which the percentiles are computed.  The
+        default (`None`) computes over the flattened array.  When an
+        axis (or axes) is given, percentiles are computed
+        independently over each slice and those axes are removed from
+        the result, exactly as in `numpy.percentile`.
+    keepdims : bool, optional
+        If `True`, the reduced axes are left in the result as
+        dimensions of size one, so the result broadcasts against the
+        input.  Defaults to `False`.
     n_threads : int, optional
         Number of parallel histogram threads.  Defaults to
         `numba.get_num_threads()`.
@@ -547,18 +708,17 @@ def percentile(arr: np.ndarray,
     Returns
     -------
     float or np.ndarray of float64
-        Scalar if `q` is scalar, else an array shaped like
-        `np.atleast_1d(q)`.
+        With `axis=None` and scalar `q` (and `keepdims=False`) a
+        Python float is returned; otherwise an array whose shape
+        matches `numpy.percentile`: `np.shape(q) + reduced_shape`,
+        where `reduced_shape` is `arr`'s shape with the reduced axes
+        removed (or set to one when `keepdims=True`).
     """
     if n_threads is None:
         n_threads = get_num_threads()
 
-    arr_flat = _as_flat_view(arr)
-    n_total = arr_flat.size
-    if n_total == 0:
-        raise ValueError('percentile of empty array is undefined')
-
-    dtype = arr_flat.dtype
+    arr = np.asarray(arr)
+    dtype = arr.dtype
     if dtype not in _DTYPE_DISPATCH and dtype not in _WIDE_DISPATCH:
         raise TypeError(_SUPPORTED_DTYPE_MESSAGE + str(dtype))
 
@@ -567,40 +727,135 @@ def percentile(arr: np.ndarray,
     q_arr = np.atleast_1d(q_in)
     if (q_arr < 0).any() or (q_arr > 100).any():
         raise ValueError('percentiles must lie in [0, 100]')
+    n_q = q_arr.shape[0]
 
-    # Sort percentiles ascending so we can scan the cumulative
-    # histogram once; remember the inverse permutation.
+    # Sort percentiles ascending so each cumulative-histogram walk
+    # scans once; `order` lets us restore the caller's input order.
     order = np.argsort(q_arr, kind='stable')
     q_sorted = q_arr[order]
 
-    exact_rank = (n_total - 1) * q_sorted / 100.0
-    ranks_lo = np.floor(exact_rank).astype(np.int64)
-    ranks_hi = np.minimum(ranks_lo + 1, n_total - 1)
-    fracs = exact_rank - ranks_lo
+    if axis is None:
+        arr_flat = _as_flat_view(arr)
+        n_total = arr_flat.size
+        if n_total == 0:
+            raise ValueError('percentile of empty array is undefined')
+        ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, n_total)
+        sorted_out = _percentile_sorted(
+            arr_flat, n_total, ranks_lo, ranks_hi, fracs, n_threads)
+        out = np.empty_like(sorted_out)
+        out[order] = sorted_out
+        if keepdims:
+            out = out.reshape((n_q,) + (1,) * arr.ndim)
+            return out[0] if q_was_scalar else out
+        if q_was_scalar:
+            return float(out[0])
+        return out
 
-    if dtype in _DTYPE_DISPATCH:
-        hist_fn, offset = _DTYPE_DISPATCH[dtype]
-        hist = hist_fn(arr_flat, n_threads)
-        sorted_out = _ranks_from_hist(hist, ranks_lo, ranks_hi, fracs, offset)
+    return _percentile_over_axis(
+        arr, axis, keepdims, n_q, order, q_sorted, q_was_scalar, n_threads)
+
+
+# A slice at least this large makes the single-pass histogram (O(n))
+# comfortably cheaper than sorting it (O(n log n)), and big enough to
+# amortize the per-slice kernel-dispatch overhead.
+_LARGE_SLICE = 4096
+# Above this many groups, sorting them all in one group-parallel
+# kernel beats looping even over large slices, because the per-slice
+# dispatch overhead starts to dominate.
+_MAX_HISTOGRAM_LOOP_GROUPS = 512
+
+
+def _use_within_slice_histogram(n_groups: int,
+                                reduced_size: int,
+                                n_threads: int) -> bool:
+    """
+    Decide whether the `axis=` reduction should loop over slices using
+    the within-slice-parallel histogram (`True`) or sort all slices in
+    one group-parallel pass (`False`).
+
+    The histogram loop wins when there are few groups (so a
+    group-parallel pass would leave cores idle) or when the slices are
+    large but not too numerous (so its single linear pass beats a sort
+    and the per-slice overhead stays amortized).
+    """
+    if n_groups <= n_threads:
+        return True
+    return (reduced_size >= _LARGE_SLICE
+            and n_groups <= _MAX_HISTOGRAM_LOOP_GROUPS)
+
+
+def _percentile_over_axis(arr: np.ndarray,
+                          axis: Union[int, Sequence[int]],
+                          keepdims: bool,
+                          n_q: int,
+                          order: np.ndarray,
+                          q_sorted: np.ndarray,
+                          q_was_scalar: bool,
+                          n_threads: int) -> np.ndarray:
+    """
+    Compute percentiles independently over each slice of `arr` along
+    the requested `axis`, assembling a result whose shape matches
+    `numpy.percentile`.
+
+    The reduced axes are moved to the end and the array reshaped to
+    `(n_groups, reduced_size)`; each group's percentiles are computed
+    with the same kernels used for the flat case.
+    """
+    reduced = normalize_axis_tuple(axis, arr.ndim, argname='axis')
+    reduced = tuple(sorted(reduced))
+    kept = tuple(a for a in range(arr.ndim) if a not in reduced)
+    kept_shape = tuple(arr.shape[a] for a in kept)
+
+    # Move the reduced axes to the end and flatten to (groups, K) so
+    # each row is one contiguous population to take percentiles of.
+    dest = tuple(range(arr.ndim - len(reduced), arr.ndim))
+    moved = np.ascontiguousarray(np.moveaxis(arr, reduced, dest))
+    n_groups = int(np.prod(kept_shape, dtype=np.int64))
+    reduced_size = int(np.prod([arr.shape[a] for a in reduced],
+                               dtype=np.int64))
+    if reduced_size == 0:
+        raise ValueError('percentile of empty array is undefined')
+    reshaped = moved.reshape(n_groups, reduced_size)
+
+    ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, reduced_size)
+    if _use_within_slice_histogram(n_groups, reduced_size, n_threads):
+        # Run one slice at a time, each histogram pass parallelizing
+        # across all threads -- the regime where this package is
+        # fastest.  Worthwhile when there are few groups (going
+        # parallel across them would leave cores idle anyway) or when
+        # the slices are large enough that the O(n) histogram clearly
+        # beats an O(n log n) sort.
+        rows_sorted = np.empty((n_groups, n_q), dtype=np.float64)
+        for g in range(n_groups):
+            rows_sorted[g] = _percentile_sorted(
+                reshaped[g], reduced_size, ranks_lo, ranks_hi, fracs,
+                n_threads)
     else:
-        view_dtype, flip, n_digits = _WIDE_DISPATCH[dtype]
-        bits = dtype.itemsize * 8
-        arr_u = arr_flat.view(view_dtype)
-        sorted_out = _resolve_wide(
-            arr_u, n_total, ranks_lo, ranks_hi, fracs,
-            flip, bits, n_digits, n_threads)
+        # Many groups of modest size: parallelize across groups
+        # instead, sorting each slice once.  This avoids the per-slice
+        # kernel-dispatch overhead that would otherwise dominate.
+        rows_sorted = _percentile_groups_sorted(
+            reshaped, ranks_lo, ranks_hi, fracs)
 
-    out = np.empty_like(sorted_out)
-    out[order] = sorted_out
-    if q_was_scalar:
-        return float(out[0])
-    return out
+    # Undo the percentile sort, then reshape (groups, n_q) into the
+    # numpy layout: a leading percentile axis, then the kept axes.
+    rows = np.empty_like(rows_sorted)
+    rows[:, order] = rows_sorted
+    res = np.moveaxis(rows.reshape(kept_shape + (n_q,)), -1, 0)
+
+    if keepdims:
+        for a in reduced:  # ascending, so each insert lands correctly
+            res = np.expand_dims(res, axis=a + 1)
+    return res[0] if q_was_scalar else res
 
 
 def median(arr: np.ndarray,
-           n_threads: Union[int, None] = None) -> float:
+           axis: Union[int, Sequence[int], None] = None,
+           keepdims: bool = False,
+           n_threads: Union[int, None] = None) -> Union[float, np.ndarray]:
     """
-    Compute the median of `arr`, equivalent to `numpy.median(arr)`.
+    Compute the median of `arr`, equivalent to
+    `numpy.median(arr, axis=axis, keepdims=keepdims)`.
 
     This is a thin wrapper around `percentile(arr, 50)`: the median
     is the 50th percentile, and the 'linear' interpolation used by
@@ -611,26 +866,42 @@ def median(arr: np.ndarray,
     ----------
     arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
             int64/uint64
-        Any shape; treated as a flat sequence of values.
+        Any shape.
+    axis : int, sequence of int, or None, optional
+        Axis or axes along which the median is computed.  The default
+        (`None`) computes over the flattened array.
+    keepdims : bool, optional
+        If `True`, the reduced axes are left in the result as
+        dimensions of size one.  Defaults to `False`.
     n_threads : int, optional
         Number of parallel histogram threads.  Defaults to
         `numba.get_num_threads()`.
 
     Returns
     -------
-    float
+    float or np.ndarray of float64
+        A Python float when reducing to a scalar (`axis=None`,
+        `keepdims=False`), otherwise an array matching
+        `numpy.median`.
     """
-    return percentile(arr, 50, n_threads=n_threads)
+    return percentile(arr, 50, axis=axis, keepdims=keepdims,
+                      n_threads=n_threads)
 
 
 def warmup() -> None:
     """
     Trigger JIT compilation for every dtype path so the first real
     call has no compile latency.  This covers the single-pass small
-    dtypes as well as the coarse and refinement kernels used by the
-    32- and 64-bit radix paths.
+    dtypes, the coarse and refinement kernels used by the 32- and
+    64-bit radix paths, and the group-parallel sort kernel used by
+    the `axis=` path.
     """
+    n_groups = max(2 * get_num_threads(), 4)
     for dtype in (np.uint8, np.int8, np.uint16, np.int16,
                   np.uint32, np.int32, np.uint64, np.int64):
         tiny = np.zeros(8, dtype=dtype)
         percentile(tiny, [0.0, 50.0, 100.0])
+        # Enough groups to take the group-parallel branch and compile
+        # `_percentile_groups_sorted` for this dtype.
+        tiny_2d = np.zeros((n_groups, 8), dtype=dtype)
+        percentile(tiny_2d, [0.0, 50.0, 100.0], axis=1)

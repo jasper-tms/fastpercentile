@@ -81,13 +81,20 @@ m = fastpercentile.median(arr)
 # Multiple percentiles in a single pass over the data
 p1, p50, p99, p99_9 = fastpercentile.percentile(arr, [1, 50, 99, 99.9])
 
+# Reduce along one or more axes, just like numpy.  Pass a single int,
+# a tuple of ints, or None (the default, which reduces everything).
+per_frame = fastpercentile.percentile(arr, 99, axis=(1, 2, 3))  # shape (305,)
+keep = fastpercentile.percentile(arr, 50, axis=0, keepdims=True)  # shape (1, 96, 69, 846)
+
 # Or just grab the histogram if you want to do something else with it.
 # (Only works for 8-bit and 16-bit values because 32-bit and 64-bit
 # histograms don't fit in memory.)
 hist = fastpercentile.histogram(arr)  # length 65536 for uint16
 ```
 
-Results match `numpy.percentile(arr, q)` with the default `'linear'` interpolation method (typically exact for integer inputs).
+Results match `numpy.percentile(arr, q, axis=axis, keepdims=keepdims)` with the default `'linear'` interpolation method (typically exact for integer inputs). In fact, on narrow signed dtypes `numpy.percentile` can overflow during its interpolation and return a value outside the data range; `fastpercentile` interpolates in float64 and stays correct.
+
+When you reduce along an axis, the work is parallelized across the resulting slices (or within each slice when there are only a few), so reductions like a per-frame percentile over an image stack stay fast. And for arrays small enough that a full histogram would be mostly empty, `fastpercentile` simply sorts instead, so it never pays the histogram's fixed cost on a tiny input.
 
 
 
