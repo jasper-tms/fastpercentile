@@ -1,4 +1,4 @@
-# fastpercentile: As-fast-as-possible median & percentile calculation on integer arrays
+# fastpercentile: As-fast-as-possible median & percentile calculation on integer and float arrays
 
 [![Tests](https://github.com/jasper-tms/fastpercentile/actions/workflows/tests.yml/badge.svg)](https://github.com/jasper-tms/fastpercentile/actions/workflows/tests.yml)
 [![PyPI version](https://img.shields.io/pypi/v/fastpercentile)](https://pypi.org/project/fastpercentile/)
@@ -61,7 +61,14 @@ For 32- and 64-bit integers, a direct histogram over all possible values is infe
 
 </details>
 
-Floats are not supported — for those, use `numpy.percentile` or `bottleneck.nanpercentile`.
+<details>
+<summary>Click to read how the same approach extends to <code>float32</code> and <code>float64</code>.</summary>
+
+IEEE 754 floating-point numbers have an order-preserving bijection to unsigned integers of the same width: reinterpret the raw bits as an unsigned integer, then set the sign bit for non-negative values and flip every bit for negative values. After that transform, plain unsigned ordering is exactly numeric float ordering, so the **same radix refinement** used for 32- and 64-bit integers resolves float percentiles too — the original value is recovered bit-exactly at the end and the linear interpolation is done in float64. NaNs are detected and skipped while the histogram is built (and counted, so `percentile` can propagate them like numpy while `nanpercentile` ignores them). `float32` runs at the same speed as `int32` (a 2-digit radix) and `float64` at the speed of `int64` (a 4-digit radix), so floats are slower than the single-pass 16-bit case but still several times faster than `numpy.percentile` (roughly 10× for `float32` and 3× for `float64` on large arrays).
+
+</details>
+
+There is one deliberate difference from `numpy.percentile` on non-finite data: when a requested rank is integral (no interpolation needed) but a neighboring value is infinite, `numpy.percentile` still evaluates its interpolation term and returns `NaN` (`0 * inf`), whereas `fastpercentile` returns the exact order statistic — which is what `numpy.median` returns in the same situation. This is the same spirit as the narrow-signed-integer case above, where we avoid a numpy overflow.
 
 
 ### Usage
@@ -85,6 +92,15 @@ p1, p50, p99, p99_9 = fastpercentile.percentile(arr, [1, 50, 99, 99.9])
 # a tuple of ints, or None (the default, which reduces everything).
 per_frame = fastpercentile.percentile(arr, 99, axis=(1, 2, 3))  # shape (305,)
 keep = fastpercentile.percentile(arr, 50, axis=0, keepdims=True)  # shape (1, 96, 69, 846)
+
+# Floats work too (float32 and float64).  By default any NaN
+# propagates, just like numpy; use the nan-aware variants to ignore
+# NaNs instead.
+floats = np.random.standard_normal((1000, 1000)).astype(np.float32)
+floats[floats > 3] = np.nan
+m = fastpercentile.median(floats)                 # NaN, because NaNs are present
+m = fastpercentile.nanmedian(floats)              # ignores the NaNs
+p = fastpercentile.nanpercentile(floats, [25, 75], axis=1)  # shape (2, 1000)
 
 # Or just grab the histogram if you want to do something else with it.
 # (Only works for 8-bit and 16-bit values because 32-bit and 64-bit

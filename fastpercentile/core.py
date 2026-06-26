@@ -33,13 +33,27 @@ For wider integers we split each value into 16-bit digits (most
 significant first) and resolve those digits one pass at a time, as
 described above.
 
+`float32` and `float64` are supported through the same radix
+refinement: each value's raw bits are mapped to an order-preserving
+unsigned key (set the sign bit for non-negative values, flip every
+bit for negative ones), so unsigned ordering matches numeric float
+ordering and the exact value is recovered at the end.  NaNs are
+detected and skipped while binning, then either propagated (matching
+`numpy.percentile`) or ignored (matching `numpy.nanpercentile`).
+
 Public API
 ----------
-`percentile(arr, q, n_threads=None)`
+`percentile(arr, q, axis=None, keepdims=False, n_threads=None)`
     Compute one or more percentiles.  Mirrors `numpy.percentile`.
 
+`median(arr, axis=None, keepdims=False, n_threads=None)`
+    Compute the median.  Mirrors `numpy.median`.
+
+`nanpercentile`, `nanmedian`
+    As above but ignoring NaNs.  Mirror the `numpy.nan*` versions.
+
 `histogram(arr, n_threads=None)`
-    Build a parallel histogram of `arr`.
+    Build a parallel histogram of `arr` (integer dtypes only).
 """
 import numpy as np
 from numba import njit, prange, get_num_threads
@@ -50,7 +64,8 @@ try:  # numpy >= 2.0
 except ImportError:  # numpy < 2.0
     from numpy.core.numeric import normalize_axis_tuple
 
-__all__ = ['percentile', 'median', 'histogram', 'warmup']
+__all__ = ['percentile', 'median', 'nanpercentile', 'nanmedian',
+           'histogram', 'warmup']
 
 
 # --------------------------------------------------------------- #
@@ -255,6 +270,142 @@ def _hist_digit_refine(arr_u: np.ndarray,
 
 
 # --------------------------------------------------------------- #
+# Float key notes.
+#
+# IEEE 754 floats have a famous order-preserving bijection to
+# unsigned integers of the same width: reinterpret the raw bits as
+# unsigned, then for non-negative values set the sign bit, and for
+# negative values flip every bit.  After this transform plain
+# unsigned ordering is exactly numeric float ordering (with -0.0 just
+# below +0.0), so the very same radix refinement used for wide
+# integers resolves float percentiles too.  We undo the transform and
+# reinterpret the bits back to a float only at the very end.
+#
+# The transform is computed per element (it depends on each value's
+# sign bit) as `key = bits ^ mask`, where
+#     mask = ((0 - sign_bit_of_value) | sign_bit) & value_mask
+# which is `sign_bit` for non-negative values (setting just the sign
+# bit) and all ones for negative values (flipping every bit).  NaNs
+# -- exponent all ones and mantissa non-zero -- are detected and
+# skipped while building the histogram, and counted separately so the
+# caller can either propagate them (matching `numpy.percentile`) or
+# ignore them (matching `numpy.nanpercentile`).
+# --------------------------------------------------------------- #
+
+
+@njit(cache=True, parallel=True, boundscheck=False)
+def _hist_digit_coarse_float(arr_u: np.ndarray,
+                             n_threads: int,
+                             sign_bit: np.uint64,
+                             value_mask: np.uint64,
+                             sign_shift: np.uint64,
+                             exponent_mask: np.uint64,
+                             mantissa_mask: np.uint64,
+                             shift: np.uint64) -> Tuple[np.ndarray, int]:
+    """
+    Parallel histogram of one 16-bit digit of the order-preserving
+    float key, over every element.  Used for the first (most
+    significant) pass.
+
+    Returns the histogram and the total number of NaN values, which
+    are skipped (not binned).
+    """
+    n_bins = 65536
+    n = arr_u.shape[0]
+    mask = np.uint64(0xFFFF)
+    zero = np.uint64(0)
+    local = np.zeros((n_threads, n_bins), dtype=np.int64)
+    nan_local = np.zeros(n_threads, dtype=np.int64)
+    chunk = (n + n_threads - 1) // n_threads
+    for t in prange(n_threads):
+        start = t * chunk
+        end = start + chunk
+        if end > n:
+            end = n
+        loc = local[t]
+        nan_count = np.int64(0)
+        for i in range(start, end):
+            raw = np.uint64(arr_u[i])
+            if (raw & exponent_mask) == exponent_mask and \
+                    (raw & mantissa_mask) != zero:
+                nan_count += 1
+                continue
+            sign = raw >> sign_shift
+            transform = ((zero - sign) | sign_bit) & value_mask
+            key = raw ^ transform
+            digit = (key >> shift) & mask
+            loc[digit] += 1
+        nan_local[t] = nan_count
+    out = np.zeros(n_bins, dtype=np.int64)
+    for t in range(n_threads):
+        for b in range(n_bins):
+            out[b] += local[t, b]
+    total_nan = np.int64(0)
+    for t in range(n_threads):
+        total_nan += nan_local[t]
+    return out, total_nan
+
+
+@njit(cache=True, parallel=True, boundscheck=False)
+def _hist_digit_refine_float(arr_u: np.ndarray,
+                             n_threads: int,
+                             sign_bit: np.uint64,
+                             value_mask: np.uint64,
+                             sign_shift: np.uint64,
+                             exponent_mask: np.uint64,
+                             mantissa_mask: np.uint64,
+                             shift: np.uint64,
+                             prefixes: np.ndarray) -> np.ndarray:
+    """
+    Parallel histogram of the 16-bit digit at `shift` of the float
+    key, but only for elements whose higher bits match one of the
+    sorted `prefixes`.  NaNs are skipped, exactly as in the coarse
+    pass.
+    """
+    n_bins = 65536
+    n_slots = prefixes.shape[0]
+    n = arr_u.shape[0]
+    mask = np.uint64(0xFFFF)
+    zero = np.uint64(0)
+    prefix_shift = shift + np.uint64(16)
+    local = np.zeros((n_threads, n_slots, n_bins), dtype=np.int64)
+    chunk = (n + n_threads - 1) // n_threads
+    for t in prange(n_threads):
+        start = t * chunk
+        end = start + chunk
+        if end > n:
+            end = n
+        loc = local[t]
+        for i in range(start, end):
+            raw = np.uint64(arr_u[i])
+            if (raw & exponent_mask) == exponent_mask and \
+                    (raw & mantissa_mask) != zero:
+                continue
+            sign = raw >> sign_shift
+            transform = ((zero - sign) | sign_bit) & value_mask
+            key = raw ^ transform
+            prefix = key >> prefix_shift
+            # Binary search for `prefix` in the sorted prefix list.
+            lo = 0
+            hi = n_slots
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if prefixes[mid] < prefix:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < n_slots and prefixes[lo] == prefix:
+                digit = (key >> shift) & mask
+                loc[lo, digit] += 1
+    out = np.zeros((n_slots, n_bins), dtype=np.int64)
+    for t in range(n_threads):
+        for s in range(n_slots):
+            for b in range(n_bins):
+                out[s, b] += local[t, s, b]
+    return out
+
+
+# --------------------------------------------------------------- #
 # Rank-walking from a finished histogram.  Caller must sort the
 # percentiles ascending so we can scan the cumulative count once.
 # --------------------------------------------------------------- #
@@ -362,6 +513,88 @@ def _percentile_groups_sorted(reshaped: np.ndarray,
     return out
 
 
+@njit(cache=True, parallel=True, boundscheck=False)
+def _percentile_groups_float(reshaped: np.ndarray,
+                             q_sorted: np.ndarray,
+                             propagate: bool) -> np.ndarray:
+    """
+    Percentiles of every row of a float `reshaped` array, in parallel,
+    with NaN handling.
+
+    Because each row may contain a different number of NaNs, the
+    bracketing ranks are derived per row from that row's valid
+    (non-NaN) count rather than shared across rows.
+
+    Parameters
+    ----------
+    reshaped : 2D float array, shape (n_groups, reduced_size)
+        Each row is one population to take percentiles of.
+    q_sorted : float64 array
+        Percentiles in [0, 100], sorted ascending.
+    propagate : bool
+        If `True`, a row containing any NaN yields all-NaN results
+        (matching `numpy.percentile`).  If `False`, NaNs are dropped
+        before computing the row's percentiles (matching
+        `numpy.nanpercentile`); an all-NaN row still yields NaN.
+
+    Returns
+    -------
+    float64 array, shape (n_groups, n_q)
+        Percentiles per row, in the same order as `q_sorted`.
+    """
+    n_groups = reshaped.shape[0]
+    size = reshaped.shape[1]
+    n_q = q_sorted.shape[0]
+    out = np.empty((n_groups, n_q), dtype=np.float64)
+    for g in prange(n_groups):
+        row = reshaped[g]
+        nan_count = 0
+        for i in range(size):
+            value = row[i]
+            if value != value:
+                nan_count += 1
+        if propagate and nan_count > 0:
+            for q in range(n_q):
+                out[g, q] = np.nan
+            continue
+        n_valid = size - nan_count
+        if n_valid <= 0:
+            for q in range(n_q):
+                out[g, q] = np.nan
+            continue
+        if nan_count == 0:
+            srt = np.sort(row)
+        else:
+            # Compact the non-NaN values, then sort just those.
+            buffer = np.empty(n_valid, dtype=row.dtype)
+            j = 0
+            for i in range(size):
+                value = row[i]
+                if value == value:
+                    buffer[j] = value
+                    j += 1
+            srt = np.sort(buffer)
+        for q in range(n_q):
+            exact_rank = (n_valid - 1) * q_sorted[q] / 100.0
+            rank_lo = int(np.floor(exact_rank))
+            rank_hi = rank_lo + 1
+            if rank_hi > n_valid - 1:
+                rank_hi = n_valid - 1
+            frac = exact_rank - rank_lo
+            val_lo = np.float64(srt[rank_lo])
+            val_hi = np.float64(srt[rank_hi])
+            # When the rank is integral (or the bracket is degenerate)
+            # the answer is exactly `val_lo`; computing the
+            # interpolation term anyway would turn an infinite endpoint
+            # into a spurious NaN (0 * inf), which `numpy.median`
+            # likewise avoids.
+            if frac == 0.0 or val_lo == val_hi:
+                out[g, q] = val_lo
+            else:
+                out[g, q] = val_lo + frac * (val_hi - val_lo)
+    return out
+
+
 # --------------------------------------------------------------- #
 # Public entry points.
 # --------------------------------------------------------------- #
@@ -384,9 +617,24 @@ _WIDE_DISPATCH = {
     np.dtype('int64'):  (np.uint64, 1 << 63,      4),
 }
 
+# Floating-point dtypes, resolved by the same radix refinement after
+# mapping each value's raw bits to an order-preserving unsigned key
+# (see `_float_key_notes` below).  Each entry is
+# (unsigned view dtype, sign bit, value mask, exponent mask,
+#  mantissa mask, number of 16-bit digits, width in bits).
+_FLOAT_DISPATCH = {
+    np.dtype('float32'): (np.uint32,
+                          1 << 31, 0xFFFFFFFF,
+                          0x7F800000, 0x007FFFFF, 2, 32),
+    np.dtype('float64'): (np.uint64,
+                          1 << 63, 0xFFFFFFFFFFFFFFFF,
+                          0x7FF0000000000000, 0x000FFFFFFFFFFFFF, 4, 64),
+}
+
 _SUPPORTED_DTYPE_MESSAGE = (
-    'fastpercentile supports int8/uint8/int16/uint16 (single pass) and '
-    'int32/uint32/int64/uint64 (radix refinement), got ')
+    'fastpercentile supports int8/uint8/int16/uint16 (single pass), '
+    'int32/uint32/int64/uint64 (radix refinement), and float32/float64, '
+    'got ')
 
 
 def _key_to_value(key: int,
@@ -416,6 +664,43 @@ def _key_to_value(key: int,
     if unsigned_value >= (1 << (bits - 1)):
         return float(unsigned_value - (1 << bits))
     return float(unsigned_value)
+
+
+def _key_to_value_float(key: int,
+                        sign_bit: int,
+                        value_mask: int,
+                        bits: int) -> float:
+    """
+    Invert the order-preserving float transform and reinterpret the
+    resulting bit pattern as the original float value.
+
+    Parameters
+    ----------
+    key : int
+        The order-preserving unsigned key (all digits resolved).
+    sign_bit : int
+        The sign bit of the dtype (`2 ** (bits - 1)`).
+    value_mask : int
+        All ones across the dtype's width (used to keep the negative
+        branch within that width).
+    bits : int
+        Width of the original dtype in bits (32 or 64).
+
+    Returns
+    -------
+    float
+    """
+    # The transform set the sign bit for non-negative values, so a key
+    # with the sign bit set came from a non-negative value (undo by
+    # clearing it); otherwise it came from a negative value (undo by
+    # flipping every bit).
+    if key & sign_bit:
+        raw_bits = key ^ sign_bit
+    else:
+        raw_bits = (~key) & value_mask
+    if bits == 32:
+        return float(np.uint32(raw_bits).view(np.float32))
+    return float(np.uint64(raw_bits).view(np.float64))
 
 
 def _resolve_wide(arr_u: np.ndarray,
@@ -512,6 +797,113 @@ def _resolve_wide(arr_u: np.ndarray,
         value_lo = value_by_rank[int(ranks_lo[k])]
         value_hi = value_by_rank[int(ranks_hi[k])]
         out[k] = value_lo + fracs[k] * (value_hi - value_lo)
+    return out
+
+
+def _resolve_wide_float(arr_u: np.ndarray,
+                        n_total: int,
+                        q_sorted: np.ndarray,
+                        sign_bit: int,
+                        value_mask: int,
+                        sign_shift: int,
+                        exponent_mask: int,
+                        mantissa_mask: int,
+                        bits: int,
+                        n_digits: int,
+                        propagate: bool,
+                        n_threads: int) -> np.ndarray:
+    """
+    Resolve percentiles for a float array by radix refinement of the
+    order-preserving key, with NaN handling.
+
+    The coarse pass both histograms the most significant digit and
+    counts NaNs (which it skips), so the bracketing ranks are computed
+    from the valid (non-NaN) count.  Refinement then proceeds exactly
+    as for wide integers.
+
+    Parameters
+    ----------
+    arr_u : np.ndarray
+        The input reinterpreted as an unsigned integer array of the
+        same width.
+    n_total : int
+        Total number of elements (including any NaNs).
+    q_sorted : float64 array
+        Percentiles in [0, 100], sorted ascending.
+    sign_bit, value_mask, sign_shift, exponent_mask, mantissa_mask : int
+        Bit-layout constants for the dtype (see `_FLOAT_DISPATCH`).
+    bits : int
+        Width of the original dtype in bits.
+    n_digits : int
+        Number of 16-bit digits to resolve (`bits // 16`).
+    propagate : bool
+        If `True`, return all-NaN when any NaN is present; if `False`,
+        ignore NaNs and compute over the valid values.
+    n_threads : int
+        Number of parallel threads.
+
+    Returns
+    -------
+    float64 array of percentile values, aligned with `q_sorted`.
+    """
+    n_q = q_sorted.shape[0]
+    shift = 16 * (n_digits - 1)
+
+    # Coarse pass: histogram the top digit and count (skipped) NaNs.
+    hist, n_nan = _hist_digit_coarse_float(
+        arr_u, n_threads, np.uint64(sign_bit), np.uint64(value_mask),
+        np.uint64(sign_shift), np.uint64(exponent_mask),
+        np.uint64(mantissa_mask), np.uint64(shift))
+    n_nan = int(n_nan)
+    n_valid = n_total - n_nan
+    if n_valid <= 0:
+        return np.full(n_q, np.nan)
+    if propagate and n_nan > 0:
+        return np.full(n_q, np.nan)
+
+    ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, n_valid)
+    target_ranks = np.unique(np.concatenate([ranks_lo, ranks_hi]))
+    n_targets = target_ranks.shape[0]
+    resolved = np.zeros(n_targets, dtype=np.uint64)
+    base = np.zeros(n_targets, dtype=np.int64)
+
+    cum = np.cumsum(hist)
+    bins = np.searchsorted(cum, target_ranks, side='right')
+    resolved[:] = bins.astype(np.uint64)
+    base[:] = cum[bins] - hist[bins]
+    shift -= 16
+
+    while shift >= 0:
+        prefixes = np.unique(resolved)
+        hists = _hist_digit_refine_float(
+            arr_u, n_threads, np.uint64(sign_bit), np.uint64(value_mask),
+            np.uint64(sign_shift), np.uint64(exponent_mask),
+            np.uint64(mantissa_mask), np.uint64(shift), prefixes)
+        cums = np.cumsum(hists, axis=1)
+        for j in range(n_targets):
+            slot = int(np.searchsorted(prefixes, resolved[j]))
+            local_rank = int(target_ranks[j] - base[j])
+            digit = int(np.searchsorted(cums[slot], local_rank, side='right'))
+            cum_before = int(cums[slot, digit] - hists[slot, digit])
+            resolved[j] = (resolved[j] << np.uint64(16)) | np.uint64(digit)
+            base[j] += cum_before
+        shift -= 16
+
+    value_by_rank = {
+        int(target_ranks[j]): _key_to_value_float(
+            int(resolved[j]), sign_bit, value_mask, bits)
+        for j in range(n_targets)
+    }
+    out = np.empty(n_q, dtype=np.float64)
+    for k in range(n_q):
+        value_lo = value_by_rank[int(ranks_lo[k])]
+        value_hi = value_by_rank[int(ranks_hi[k])]
+        # See `_percentile_groups_float`: skip interpolation on an
+        # integral rank so an infinite endpoint does not become NaN.
+        if fracs[k] == 0.0 or value_lo == value_hi:
+            out[k] = value_lo
+        else:
+            out[k] = value_lo + fracs[k] * (value_hi - value_lo)
     return out
 
 
@@ -612,7 +1004,12 @@ def _sort_cutoff(dtype: np.dtype) -> int:
     the crossover close to this product for every dtype.
     """
     n_bins = 256 if dtype.itemsize == 1 else 65536
-    n_digits = _WIDE_DISPATCH[dtype][2] if dtype in _WIDE_DISPATCH else 1
+    if dtype in _WIDE_DISPATCH:
+        n_digits = _WIDE_DISPATCH[dtype][2]
+    elif dtype in _FLOAT_DISPATCH:
+        n_digits = _FLOAT_DISPATCH[dtype][5]
+    else:
+        n_digits = 1
     return n_bins * n_digits
 
 
@@ -666,6 +1063,126 @@ def _percentile_sorted(arr_flat: np.ndarray,
         flip, bits, n_digits, n_threads)
 
 
+def _percentile_by_sorting_float(arr_flat: np.ndarray,
+                                 q_sorted: np.ndarray,
+                                 propagate: bool) -> np.ndarray:
+    """
+    Percentiles of a single small float array by directly sorting it,
+    with NaN handling.
+
+    `numpy.sort` places NaNs at the end, so taking ranks over the
+    valid count reads only non-NaN values.  Returns the percentiles in
+    the same order as `q_sorted`.
+    """
+    n_q = q_sorted.shape[0]
+    n_total = arr_flat.size
+    n_nan = int(np.isnan(arr_flat).sum())
+    n_valid = n_total - n_nan
+    if n_valid <= 0:
+        return np.full(n_q, np.nan)
+    if propagate and n_nan > 0:
+        return np.full(n_q, np.nan)
+    ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, n_valid)
+    srt = np.sort(arr_flat)  # NaNs, if any, sort to the end
+    val_lo = srt[ranks_lo].astype(np.float64)
+    val_hi = srt[ranks_hi].astype(np.float64)
+    # On an integral rank (or a degenerate bracket) the answer is
+    # exactly `val_lo`; interpolate only where it is actually needed so
+    # an infinite endpoint never becomes a spurious NaN (0 * inf).
+    result = val_lo.copy()
+    interpolate = (fracs != 0.0) & (val_lo != val_hi)
+    result[interpolate] = (
+        val_lo[interpolate]
+        + fracs[interpolate] * (val_hi[interpolate] - val_lo[interpolate]))
+    return result
+
+
+def _percentile_float_1d(arr_flat: np.ndarray,
+                         q_sorted: np.ndarray,
+                         propagate: bool,
+                         n_threads: int) -> np.ndarray:
+    """
+    Compute percentiles for a single contiguous 1D float array,
+    returning them in the same order as `q_sorted`.
+
+    Sorts directly when the array is smaller than the histogram bin
+    count; otherwise resolves the order-preserving key by radix
+    refinement.  `propagate` selects NaN-propagating (`numpy.percentile`)
+    versus NaN-ignoring (`numpy.nanpercentile`) behavior.
+    """
+    dtype = arr_flat.dtype
+    n_total = arr_flat.size
+    if n_total < _sort_cutoff(dtype):
+        return _percentile_by_sorting_float(arr_flat, q_sorted, propagate)
+    (view_dtype, sign_bit, value_mask, exponent_mask,
+     mantissa_mask, n_digits, bits) = _FLOAT_DISPATCH[dtype]
+    arr_u = arr_flat.view(view_dtype)
+    return _resolve_wide_float(
+        arr_u, n_total, q_sorted, sign_bit, value_mask, bits - 1,
+        exponent_mask, mantissa_mask, bits, n_digits, propagate, n_threads)
+
+
+def _percentile_impl(arr: np.ndarray,
+                     q: Union[float, Sequence[float], np.ndarray],
+                     axis: Union[int, Sequence[int], None],
+                     keepdims: bool,
+                     n_threads: Union[int, None],
+                     propagate: bool) -> Union[float, np.ndarray]:
+    """
+    Shared workhorse for `percentile`/`median` (`propagate=True`) and
+    `nanpercentile`/`nanmedian` (`propagate=False`).
+
+    `propagate` only affects float inputs, which may contain NaNs;
+    integer inputs cannot, so it is ignored for them.
+    """
+    if n_threads is None:
+        n_threads = get_num_threads()
+
+    arr = np.asarray(arr)
+    dtype = arr.dtype
+    is_float = dtype in _FLOAT_DISPATCH
+    if (dtype not in _DTYPE_DISPATCH and dtype not in _WIDE_DISPATCH
+            and not is_float):
+        raise TypeError(_SUPPORTED_DTYPE_MESSAGE + str(dtype))
+
+    q_in = np.asarray(q, dtype=np.float64)
+    q_was_scalar = (q_in.ndim == 0)
+    q_arr = np.atleast_1d(q_in)
+    if (q_arr < 0).any() or (q_arr > 100).any():
+        raise ValueError('percentiles must lie in [0, 100]')
+    n_q = q_arr.shape[0]
+
+    # Sort percentiles ascending so each cumulative-histogram walk
+    # scans once; `order` lets us restore the caller's input order.
+    order = np.argsort(q_arr, kind='stable')
+    q_sorted = q_arr[order]
+
+    if axis is None:
+        arr_flat = _as_flat_view(arr)
+        n_total = arr_flat.size
+        if n_total == 0:
+            raise ValueError('percentile of empty array is undefined')
+        if is_float:
+            sorted_out = _percentile_float_1d(
+                arr_flat, q_sorted, propagate, n_threads)
+        else:
+            ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, n_total)
+            sorted_out = _percentile_sorted(
+                arr_flat, n_total, ranks_lo, ranks_hi, fracs, n_threads)
+        out = np.empty_like(sorted_out)
+        out[order] = sorted_out
+        if keepdims:
+            out = out.reshape((n_q,) + (1,) * arr.ndim)
+            return out[0] if q_was_scalar else out
+        if q_was_scalar:
+            return float(out[0])
+        return out
+
+    return _percentile_over_axis(
+        arr, axis, keepdims, n_q, order, q_sorted, q_was_scalar,
+        is_float, propagate, n_threads)
+
+
 def percentile(arr: np.ndarray,
                q: Union[float, Sequence[float], np.ndarray],
                axis: Union[int, Sequence[int], None] = None,
@@ -682,12 +1199,16 @@ def percentile(arr: np.ndarray,
 
     For int8/uint8/int16/uint16 this is a single parallel histogram
     pass; for int32/uint32/int64/uint64 it is a radix refinement of
-    two (32-bit) or four (64-bit) passes.
+    two (32-bit) or four (64-bit) passes.  float32 and float64 are
+    supported too, via the same radix refinement on an
+    order-preserving mapping of the float bits.  If the data contains
+    any NaN, the result is NaN, matching `numpy.percentile`; use
+    `nanpercentile` to ignore NaNs instead.
 
     Parameters
     ----------
     arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
-            int64/uint64
+            int64/uint64/float32/float64
         Any shape.
     q : float or sequence of floats in [0, 100]
         Percentile(s) to compute.
@@ -714,45 +1235,8 @@ def percentile(arr: np.ndarray,
         where `reduced_shape` is `arr`'s shape with the reduced axes
         removed (or set to one when `keepdims=True`).
     """
-    if n_threads is None:
-        n_threads = get_num_threads()
-
-    arr = np.asarray(arr)
-    dtype = arr.dtype
-    if dtype not in _DTYPE_DISPATCH and dtype not in _WIDE_DISPATCH:
-        raise TypeError(_SUPPORTED_DTYPE_MESSAGE + str(dtype))
-
-    q_in = np.asarray(q, dtype=np.float64)
-    q_was_scalar = (q_in.ndim == 0)
-    q_arr = np.atleast_1d(q_in)
-    if (q_arr < 0).any() or (q_arr > 100).any():
-        raise ValueError('percentiles must lie in [0, 100]')
-    n_q = q_arr.shape[0]
-
-    # Sort percentiles ascending so each cumulative-histogram walk
-    # scans once; `order` lets us restore the caller's input order.
-    order = np.argsort(q_arr, kind='stable')
-    q_sorted = q_arr[order]
-
-    if axis is None:
-        arr_flat = _as_flat_view(arr)
-        n_total = arr_flat.size
-        if n_total == 0:
-            raise ValueError('percentile of empty array is undefined')
-        ranks_lo, ranks_hi, fracs = _ranks_for(q_sorted, n_total)
-        sorted_out = _percentile_sorted(
-            arr_flat, n_total, ranks_lo, ranks_hi, fracs, n_threads)
-        out = np.empty_like(sorted_out)
-        out[order] = sorted_out
-        if keepdims:
-            out = out.reshape((n_q,) + (1,) * arr.ndim)
-            return out[0] if q_was_scalar else out
-        if q_was_scalar:
-            return float(out[0])
-        return out
-
-    return _percentile_over_axis(
-        arr, axis, keepdims, n_q, order, q_sorted, q_was_scalar, n_threads)
+    return _percentile_impl(arr, q, axis, keepdims, n_threads,
+                            propagate=True)
 
 
 # A slice at least this large makes the single-pass histogram (O(n))
@@ -791,6 +1275,8 @@ def _percentile_over_axis(arr: np.ndarray,
                           order: np.ndarray,
                           q_sorted: np.ndarray,
                           q_was_scalar: bool,
+                          is_float: bool,
+                          propagate: bool,
                           n_threads: int) -> np.ndarray:
     """
     Compute percentiles independently over each slice of `arr` along
@@ -827,15 +1313,23 @@ def _percentile_over_axis(arr: np.ndarray,
         # beats an O(n log n) sort.
         rows_sorted = np.empty((n_groups, n_q), dtype=np.float64)
         for g in range(n_groups):
-            rows_sorted[g] = _percentile_sorted(
-                reshaped[g], reduced_size, ranks_lo, ranks_hi, fracs,
-                n_threads)
+            if is_float:
+                rows_sorted[g] = _percentile_float_1d(
+                    reshaped[g], q_sorted, propagate, n_threads)
+            else:
+                rows_sorted[g] = _percentile_sorted(
+                    reshaped[g], reduced_size, ranks_lo, ranks_hi, fracs,
+                    n_threads)
     else:
         # Many groups of modest size: parallelize across groups
         # instead, sorting each slice once.  This avoids the per-slice
         # kernel-dispatch overhead that would otherwise dominate.
-        rows_sorted = _percentile_groups_sorted(
-            reshaped, ranks_lo, ranks_hi, fracs)
+        if is_float:
+            rows_sorted = _percentile_groups_float(
+                reshaped, q_sorted, propagate)
+        else:
+            rows_sorted = _percentile_groups_sorted(
+                reshaped, ranks_lo, ranks_hi, fracs)
 
     # Undo the percentile sort, then reshape (groups, n_q) into the
     # numpy layout: a leading percentile axis, then the kept axes.
@@ -865,8 +1359,9 @@ def median(arr: np.ndarray,
     Parameters
     ----------
     arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
-            int64/uint64
-        Any shape.
+            int64/uint64/float32/float64
+        Any shape.  A float input containing any NaN yields NaN,
+        matching `numpy.median`; use `nanmedian` to ignore NaNs.
     axis : int, sequence of int, or None, optional
         Axis or axes along which the median is computed.  The default
         (`None`) computes over the flattened array.
@@ -884,8 +1379,85 @@ def median(arr: np.ndarray,
         `keepdims=False`), otherwise an array matching
         `numpy.median`.
     """
-    return percentile(arr, 50, axis=axis, keepdims=keepdims,
-                      n_threads=n_threads)
+    return _percentile_impl(arr, 50, axis, keepdims, n_threads,
+                            propagate=True)
+
+
+def nanpercentile(arr: np.ndarray,
+                  q: Union[float, Sequence[float], np.ndarray],
+                  axis: Union[int, Sequence[int], None] = None,
+                  keepdims: bool = False,
+                  n_threads: Union[int, None] = None
+                  ) -> Union[float, np.ndarray]:
+    """
+    Compute percentiles of `arr` ignoring any NaNs, matching
+    `numpy.nanpercentile(arr, q, axis=axis, keepdims=keepdims)`.
+
+    Identical to `percentile` except that NaNs are dropped before the
+    percentiles are computed, so each slice is reduced over only its
+    finite (non-NaN) values.  A slice that is entirely NaN yields NaN.
+    For integer inputs (which cannot contain NaN) this is exactly
+    `percentile`.
+
+    Parameters
+    ----------
+    arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
+            int64/uint64/float32/float64
+        Any shape.
+    q : float or sequence of floats in [0, 100]
+        Percentile(s) to compute.
+    axis : int, sequence of int, or None, optional
+        Axis or axes along which the percentiles are computed.  The
+        default (`None`) computes over the flattened array.
+    keepdims : bool, optional
+        If `True`, the reduced axes are left in the result as
+        dimensions of size one.  Defaults to `False`.
+    n_threads : int, optional
+        Number of parallel histogram threads.  Defaults to
+        `numba.get_num_threads()`.
+
+    Returns
+    -------
+    float or np.ndarray of float64
+        Same shape convention as `percentile`.
+    """
+    return _percentile_impl(arr, q, axis, keepdims, n_threads,
+                            propagate=False)
+
+
+def nanmedian(arr: np.ndarray,
+              axis: Union[int, Sequence[int], None] = None,
+              keepdims: bool = False,
+              n_threads: Union[int, None] = None
+              ) -> Union[float, np.ndarray]:
+    """
+    Compute the median of `arr` ignoring any NaNs, equivalent to
+    `numpy.nanmedian(arr, axis=axis, keepdims=keepdims)`.
+
+    A thin wrapper around `nanpercentile(arr, 50)`.
+
+    Parameters
+    ----------
+    arr : np.ndarray of int8/uint8/int16/uint16/int32/uint32/
+            int64/uint64/float32/float64
+        Any shape.
+    axis : int, sequence of int, or None, optional
+        Axis or axes along which the median is computed.  The default
+        (`None`) computes over the flattened array.
+    keepdims : bool, optional
+        If `True`, the reduced axes are left in the result as
+        dimensions of size one.  Defaults to `False`.
+    n_threads : int, optional
+        Number of parallel histogram threads.  Defaults to
+        `numba.get_num_threads()`.
+
+    Returns
+    -------
+    float or np.ndarray of float64
+        Same shape convention as `median`.
+    """
+    return _percentile_impl(arr, 50, axis, keepdims, n_threads,
+                            propagate=False)
 
 
 def warmup() -> None:
@@ -898,10 +1470,12 @@ def warmup() -> None:
     """
     n_groups = max(2 * get_num_threads(), 4)
     for dtype in (np.uint8, np.int8, np.uint16, np.int16,
-                  np.uint32, np.int32, np.uint64, np.int64):
+                  np.uint32, np.int32, np.uint64, np.int64,
+                  np.float32, np.float64):
         tiny = np.zeros(8, dtype=dtype)
         percentile(tiny, [0.0, 50.0, 100.0])
         # Enough groups to take the group-parallel branch and compile
-        # `_percentile_groups_sorted` for this dtype.
+        # `_percentile_groups_sorted` (or, for floats, the NaN-aware
+        # `_percentile_groups_float`) for this dtype.
         tiny_2d = np.zeros((n_groups, 8), dtype=dtype)
         percentile(tiny_2d, [0.0, 50.0, 100.0], axis=1)
